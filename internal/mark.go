@@ -9,10 +9,13 @@ import (
 )
 
 type MarkNode struct {
-	hash []byte
+	hash  []byte
+	level int
+	tag   int
+	hType string
 }
 
-func NewMarkNode(data []byte) (*MarkNode, error) {
+func NewMarkNode(level int, tag int64, data []byte) (*MarkNode, error) {
 	size, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
 	if err != nil {
 		return nil, err
@@ -26,20 +29,53 @@ func NewMarkNode(data []byte) (*MarkNode, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var h hash.Hash
-
-	switch hashType {
-	case "SHA256":
-		h = sha256.New()
-	default:
-		h = sha256.New()
-	}
+	h := detectHash(hashType)
 
 	// Writes data
 	h.Write(data)
 
 	return &MarkNode{
-		hash: h.Sum(nil),
+		hash:  h.Sum(nil),
+		hType: hashType,
+		level: level,
+		tag:   int(tag),
 	}, nil
+}
+
+func detectHash(hType string) hash.Hash {
+
+	var h hash.Hash
+
+	switch hType {
+	case "SHA256":
+		h = sha256.New()
+	default:
+		h = sha256.New()
+	}
+	return h
+
+}
+
+func computeNewNode(m *MarkNode, n *MarkNode) (*MarkNode, error) {
+	h := detectHash(n.hType)
+	h.Write(m.hash)
+	h.Write(n.hash)
+	return &MarkNode{
+		hash:  h.Sum(nil),
+		level: m.level + 1,
+		tag:   (m.tag + n.tag) / 2,
+		hType: n.hType,
+	}, nil
+}
+
+// Writes in order for hashing, but uses the hash type of the bigger tag
+func (n *MarkNode) Hash(m *MarkNode) (*MarkNode, error) {
+	if m.level != n.level {
+		return nil, errors.New("they must be at the same level")
+	}
+	if m.tag < n.tag {
+		return computeNewNode(m, n)
+	} else {
+		return computeNewNode(n, m)
+	}
 }
