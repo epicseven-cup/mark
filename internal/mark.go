@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"hash"
+	"math"
 
 	"github.com/epicseven-cup/envgo"
 )
@@ -63,7 +64,7 @@ func computeNewNode(m *MarkNode, n *MarkNode) (*MarkNode, error) {
 	return &MarkNode{
 		hash:  h.Sum(nil),
 		level: m.level + 1,
-		tag:   (m.tag + n.tag) / 2,
+		tag:   int(math.Max(0, (math.Floor(float64((m.tag+n.tag)/2)))-1)),
 		hType: n.hType,
 	}, nil
 }
