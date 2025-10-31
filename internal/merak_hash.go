@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"fmt"
 	"log"
 	"math"
 	"os"
@@ -34,8 +33,17 @@ func MerakHash(path string) string {
 
 	defer file.Close()
 
-	job := make(chan FileJob)
+	fs, err := file.Stat()
+	if err != nil {
+		panic(err)
+	}
+
+	totalChunks := fs.Size() / int64(cs)
+	expectedHeight := int(math.Log2(float64(totalChunks))) + 1
+
 	wg := new(sync.WaitGroup)
+
+	job := make(chan FileJob)
 	jobWg := new(sync.WaitGroup)
 
 	pool := sync.Pool{
@@ -44,70 +52,60 @@ func MerakHash(path string) string {
 		},
 	}
 
-	nodes := make(chan *MarkNode, 128)
-	ans := make(chan *MarkNode)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(nodes)
-		cache := make([]map[int]*MarkNode, 128)
+	layers := make([]chan *MarkNode, expectedHeight)
 
-		for i := range cache {
-			cache[i] = make(map[int]*MarkNode)
-		}
-		endpoint := -1
-		for n := range nodes {
-			if n == nil {
-				continue
-			}
+	for i := 0; i < expectedHeight; i++ {
+		layers[i] = make(chan *MarkNode, int(totalChunks)*100)
+	}
 
-			logger.Println("merak hash tag", n.tag)
-			logger.Println("merak hash level", n.level)
-			logger.Println("merak hash cache", cache)
-			if n.level == -1 {
-				endpoint = int(math.Ceil(math.Log2(float64(n.tag)))) - 1
-				log.Println("endpoint", endpoint)
-				continue
-			}
+	for i := 0; i < expectedHeight-1; i++ {
+		wg.Add(1)
+		maxNodeLevel := math.Round(float64(int(totalChunks) / int(math.Exp2(float64(i)))))
+		go func() {
+			defer wg.Done()
+			cache := make(map[int]*MarkNode)
 
-			// incase the layers are too big like wtf bro
-			for len(cache) < n.level {
-				cache = append(cache, make(map[int]*MarkNode))
-			}
-
-			var partner *MarkNode
-			var ok bool
-			if n.tag%2 == 0 {
-				// the tag is even therefor look forward to check
-				partner, ok = cache[n.level][n.tag+1]
-			} else {
-				partner, ok = cache[n.level][n.tag-1]
-			}
-
-			if ok {
-				logger.Println("Partner", partner.tag)
-				logger.Println("N", n.tag)
-				newN, err := partner.Hash(n)
-				if err != nil {
-					panic(err)
+			for n := range layers[i] {
+				var partner *MarkNode
+				var ok bool
+				logger.Println("Tag", n.tag)
+				logger.Println("Level", n.level)
+				if n.tag%2 == 0 {
+					// the tag is even therefor look forward to check
+					partner, ok = cache[n.tag+1]
+				} else {
+					partner, ok = cache[n.tag-1]
 				}
-				nodes <- newN
-			} else {
-				cache[n.level][n.tag] = n
-			}
 
-			if endpoint > -1 {
-				v, ok := cache[endpoint][0]
-				if ok && v != nil {
-					fmt.Println(v)
-					ans <- v
-					return
+				if ok {
+					logger.Println("Partner", partner.tag)
+					logger.Println("N", n.tag)
+					logger.Println("level", n.level)
+					newN, err := partner.Hash(n)
+					if err != nil {
+						panic(err)
+					}
+
+					if i+1 > len(layers)-1 {
+						panic("going above the max layer")
+					}
+					layers[i+1] <- newN
+				}
+				cache[n.tag] = n
+
+				logger.Println("MaxNodeLevel", maxNodeLevel)
+
+				if int(maxNodeLevel) == len(cache) {
+					logger.Println("+========+")
+					logger.Println("MaxLevel Node", maxNodeLevel)
+					logger.Println("Cache", len(cache))
+					logger.Println("+========+")
+					close(layers[i])
 				}
 
 			}
-
-		}
-	}()
+		}()
+	}
 
 	for i := 0; i < ws; i++ {
 		jobWg.Add(1)
@@ -121,15 +119,11 @@ func MerakHash(path string) string {
 					return
 				}
 				// Sending the created nodes into the node channel for grouping
-				nodes <- n
+				layers[0] <- n
 			}
 		}()
 	}
 
-	fs, err := file.Stat()
-	if err != nil {
-		panic(err)
-	}
 	index := int64(0)
 	for ; index < fs.Size(); index = index + int64(cs) {
 		// Creating the filejobs for the job channel trigger
@@ -145,25 +139,21 @@ func MerakHash(path string) string {
 		if err != nil {
 			panic(err)
 		}
-		nodes <- padding
+		layers[0] <- padding
 	}
-
-	// sends the final packet as meta data
-	meta, err := NewMarkNode(-1, index/int64(cs), nil)
-	if err != nil {
-		panic(err)
-	}
-	nodes <- meta
 
 	close(job)
 	jobWg.Wait()
-	nn := <-ans
-	close(ans)
 	wg.Wait()
+	nn := <-layers[expectedHeight-1]
+	log.Println("Hello world")
+	log.Println("Final", nn.tag)
+	log.Println("Final", nn.level)
+	//for c := 0; c < expectedHeight; c++ {
+	//	close(layers[expectedHeight-c-1])
+	//}
 
-	fmt.Println(nn)
-
-	return string(nn.level)
+	return string(nn.hash)
 }
 
 func worker(file *os.File, s *sync.Pool, startIndex int64) (*MarkNode, error) {

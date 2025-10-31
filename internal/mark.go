@@ -64,7 +64,7 @@ func computeNewNode(m *MarkNode, n *MarkNode) (*MarkNode, error) {
 	return &MarkNode{
 		hash:  h.Sum(nil),
 		level: m.level + 1,
-		tag:   int(math.Max(0, (math.Floor(float64((m.tag+n.tag)/2)))-1)),
+		tag:   int(math.Ceil(float64(m.tag / 2))),
 		hType: n.hType,
 	}, nil
 }
