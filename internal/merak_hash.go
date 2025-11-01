@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/hex"
 	"log"
 	"math"
 	"os"
@@ -10,38 +11,46 @@ import (
 )
 
 type FileJob struct {
-	chunkSize  int64
-	startIndex int64
+	startIndex int
 }
 
 func MerakHash(path string) string {
 	logger := log.Default()
 	ws, err := envgo.GetValueOrDefault("MARK_WORKER", 5)
 	if err != nil {
-		panic(err)
+		logger.Fatal(err)
+		return ""
 	}
 
 	cs, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
 	if err != nil {
-		panic(err)
+		logger.Fatal(err)
+		return ""
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
-		panic(err)
+		logger.Fatal(err)
+		return ""
 	}
 
 	defer file.Close()
 
-	fs, err := file.Stat()
+	fileStat, err := file.Stat()
 	if err != nil {
-		panic(err)
+		logger.Fatal(err)
+		return ""
 	}
 
-	totalChunks := fs.Size() / int64(cs)
-	expectedHeight := int(math.Log2(float64(totalChunks))) + 1
+	fileSize := int(fileStat.Size())
 
-	wg := new(sync.WaitGroup)
+	totalChunks := fileSize / cs
+
+	// Padding the chunks
+	if totalChunks%2 != 0 {
+		totalChunks++
+	}
+	expectedHeight := uint64(math.Log2(float64(totalChunks))) + 1
 
 	job := make(chan FileJob)
 	jobWg := new(sync.WaitGroup)
@@ -54,22 +63,20 @@ func MerakHash(path string) string {
 
 	layers := make([]chan *MarkNode, expectedHeight)
 
-	for i := 0; i < expectedHeight; i++ {
-		layers[i] = make(chan *MarkNode, int(totalChunks)*100)
-	}
+	layers[expectedHeight-1] = make(chan *MarkNode, 1)
 
-	for i := 0; i < expectedHeight-1; i++ {
-		wg.Add(1)
-		maxNodeLevel := math.Round(float64(int(totalChunks) / int(math.Exp2(float64(i)))))
+	for i := uint64(0); i < expectedHeight-1; i++ {
+
+		maxNodeLevel := int(math.Round(float64(totalChunks / int(math.Exp2(float64(i))))))
+		// Buffer to the max node per level
+		layers[i] = make(chan *MarkNode, maxNodeLevel)
+
 		go func() {
-			defer wg.Done()
 			cache := make(map[int]*MarkNode)
 
 			for n := range layers[i] {
 				var partner *MarkNode
 				var ok bool
-				logger.Println("Tag", n.tag)
-				logger.Println("Level", n.level)
 				if n.tag%2 == 0 {
 					// the tag is even therefor look forward to check
 					partner, ok = cache[n.tag+1]
@@ -78,31 +85,20 @@ func MerakHash(path string) string {
 				}
 
 				if ok {
-					logger.Println("Partner", partner.tag)
-					logger.Println("N", n.tag)
-					logger.Println("level", n.level)
 					newN, err := partner.Hash(n)
 					if err != nil {
-						panic(err)
+						logger.Fatal(err)
+						return
 					}
 
-					if i+1 > len(layers)-1 {
-						panic("going above the max layer")
+					if i+1 > uint64(len(layers)-1) {
+						logger.Fatal("Reached max number of layers", n.tag)
+						return
 					}
+
 					layers[i+1] <- newN
 				}
 				cache[n.tag] = n
-
-				logger.Println("MaxNodeLevel", maxNodeLevel)
-
-				if int(maxNodeLevel) == len(cache) {
-					logger.Println("+========+")
-					logger.Println("MaxLevel Node", maxNodeLevel)
-					logger.Println("Cache", len(cache))
-					logger.Println("+========+")
-					close(layers[i])
-				}
-
 			}
 		}()
 	}
@@ -124,18 +120,15 @@ func MerakHash(path string) string {
 		}()
 	}
 
-	index := int64(0)
-	for ; index < fs.Size(); index = index + int64(cs) {
+	index := 0
+	for ; index < fileSize; index = index + cs {
 		// Creating the filejobs for the job channel trigger
-		chunkSize := min(int64(cs), fs.Size()-index)
 		job <- FileJob{
-			chunkSize:  chunkSize,
 			startIndex: index,
 		}
 	}
-	if (index/int64(cs))%2 == 0 {
-		logger.Println("Padding", index/int64(cs))
-		padding, err := NewMarkNode(0, index/int64(cs), []byte{})
+	if (index/cs)%2 == 0 {
+		padding, err := NewMarkNode(0, index/cs, []byte{})
 		if err != nil {
 			panic(err)
 		}
@@ -144,22 +137,14 @@ func MerakHash(path string) string {
 
 	close(job)
 	jobWg.Wait()
-	wg.Wait()
 	nn := <-layers[expectedHeight-1]
-	log.Println("Hello world")
-	log.Println("Final", nn.tag)
-	log.Println("Final", nn.level)
-	//for c := 0; c < expectedHeight; c++ {
-	//	close(layers[expectedHeight-c-1])
-	//}
-
-	return string(nn.hash)
+	return hex.EncodeToString(nn.hash)
 }
 
-func worker(file *os.File, s *sync.Pool, startIndex int64) (*MarkNode, error) {
+func worker(file *os.File, s *sync.Pool, startIndex int) (*MarkNode, error) {
 	buffer := s.Get().([]byte)
 	defer s.Put(buffer)
-	_, err := file.ReadAt(buffer, startIndex)
+	_, err := file.ReadAt(buffer, int64(startIndex))
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +154,7 @@ func worker(file *os.File, s *sync.Pool, startIndex int64) (*MarkNode, error) {
 		panic(err)
 	}
 
-	mn, err := NewMarkNode(0, startIndex/int64(cs), buffer)
+	mn, err := NewMarkNode(0, startIndex/cs, buffer)
 	if err != nil {
 		return nil, err
 	}

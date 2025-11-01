@@ -16,7 +16,7 @@ type MarkNode struct {
 	hType string
 }
 
-func NewMarkNode(level int, tag int64, data []byte) (*MarkNode, error) {
+func NewMarkNode(level int, tag int, data []byte) (*MarkNode, error) {
 	size, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
 	if err != nil {
 		return nil, err

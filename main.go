@@ -15,7 +15,7 @@ func init() {
 }
 
 func main() {
-	path = "image.png"
+	path = "data.pdf"
 	flag.Parse()
 	s := internal.MerakHash(path)
 	fmt.Println(s)
