@@ -11,7 +11,7 @@ func BenchmarkMerakHash(b *testing.B) {
 	if err != nil {
 		return
 	}
-	err = os.Setenv("MARK_SIZE", "128000000")
+	err = os.Setenv("MARK_SIZE", "1280000000")
 	if err != nil {
 		return
 	}
