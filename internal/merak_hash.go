@@ -1,163 +1,157 @@
 package internal
 
 import (
-	"encoding/hex"
 	"log"
 	"math"
 	"os"
-	"sync"
+	"runtime"
+	"syscall"
 
 	"github.com/epicseven-cup/envgo"
 )
 
-type FileJob struct {
-	startIndex int
+const DEFAULT_CHUNK_SIZE = 256000000
+
+var logger *log.Logger
+var chunkSize int
+var workerSize int
+var layers []chan *MarkNode
+
+type JobPacket struct {
+	start uint64
+	end   uint64
 }
 
-func MerakHash(path string) string {
-	logger := log.Default()
-	ws, err := envgo.GetValueOrDefault("MARK_WORKER", 5)
+func init() {
+	//logger = log.Default()
+	//logger.SetFlags(log.LstdFlags | log.Lshortfile)
+	var err error
+	chunkSize, err = envgo.GetValueOrDefault("MARK_SIZE", DEFAULT_CHUNK_SIZE)
+	if err != nil {
+		log.Fatal(err)
+	}
+	workerSize, err = envgo.GetValueOrDefault("MARK_WORKER", runtime.NumCPU())
 	if err != nil {
 		logger.Fatal(err)
-		return ""
 	}
 
-	cs, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
-	if err != nil {
-		logger.Fatal(err)
-		return ""
-	}
+	workerSize -= 1
+	//
+	//logger.Println("MARK_SIZE =", chunkSize)
+	//logger.Println("MARK_WORKER =", workerSize)
 
+}
+
+func MerakHash(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		logger.Fatal(err)
-		return ""
+		return nil, err
 	}
-
 	defer file.Close()
 
-	fileStat, err := file.Stat()
+	fileStats, err := file.Stat()
 	if err != nil {
-		logger.Fatal(err)
-		return ""
+		return nil, err
+	}
+	fileSize := fileStats.Size()
+
+	// Check the math in a bit
+	totalChunk := int64(math.Ceil(float64(fileSize) / float64(chunkSize)))
+	expectedHeight := uint64(math.Log2(float64(totalChunk))) + 1
+	//
+	//logger.Println("FileSize:", fileSize)
+	//logger.Println("TotalChunk:", totalChunk)
+	//logger.Println("WorkerPerChunk:", workerPerChunk)
+	//logger.Println("ExpectedHeight:", expectedHeight)
+
+	layers = make([]chan *MarkNode, expectedHeight)
+	for i := range layers {
+		layers[i] = make(chan *MarkNode, 256)
 	}
 
-	fileSize := int(fileStat.Size())
-
-	totalChunks := fileSize / cs
-
-	// Padding the chunks
-	if totalChunks%2 != 0 {
-		totalChunks++
-	}
-	expectedHeight := uint64(math.Log2(float64(totalChunks))) + 1
-
-	job := make(chan FileJob)
-	jobWg := new(sync.WaitGroup)
-
-	pool := sync.Pool{
-		New: func() interface{} {
-			return make([]byte, cs)
-		},
+	for i := range len(layers) - 1 {
+		go pipeLineBuildTree(uint64(i))
 	}
 
-	layers := make([]chan *MarkNode, expectedHeight)
-
-	layers[expectedHeight-1] = make(chan *MarkNode, 1)
-
-	for i := uint64(0); i < expectedHeight-1; i++ {
-
-		maxNodeLevel := int(math.Round(float64(totalChunks / int(math.Exp2(float64(i))))))
-		// Buffer to the max node per level
-		layers[i] = make(chan *MarkNode, maxNodeLevel)
-
-		go func() {
-			cache := make(map[int]*MarkNode)
-
-			for n := range layers[i] {
-				var partner *MarkNode
-				var ok bool
-				if n.tag%2 == 0 {
-					// the tag is even therefor look forward to check
-					partner, ok = cache[n.tag+1]
-				} else {
-					partner, ok = cache[n.tag-1]
-				}
-
-				if ok {
-					newN, err := partner.Hash(n)
-					if err != nil {
-						logger.Fatal(err)
-						return
-					}
-
-					if i+1 > uint64(len(layers)-1) {
-						logger.Fatal("Reached max number of layers", n.tag)
-						return
-					}
-
-					layers[i+1] <- newN
-				}
-				cache[n.tag] = n
-			}
-		}()
+	mmap, err := syscall.Mmap(int(file.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
+	jobs := make([]chan JobPacket, workerSize)
+	for i := 0; i < workerSize; i++ {
+		jobs[i] = make(chan JobPacket)
+		go worker(mmap, jobs[i])
 	}
-
-	for i := 0; i < ws; i++ {
-		jobWg.Add(1)
-		// Working spliting the files into chunks
-		go func() {
-			defer jobWg.Done()
-			for fileJob := range job {
-				// TODO: the worker can be concurrent too
-				n, err := worker(file, &pool, fileJob.startIndex)
-				if err != nil {
-					return
-				}
-				// Sending the created nodes into the node channel for grouping
-				layers[0] <- n
-			}
-		}()
-	}
-
-	index := 0
-	for ; index < fileSize; index = index + cs {
-		// Creating the filejobs for the job channel trigger
-		job <- FileJob{
-			startIndex: index,
+	currentIndex := 0
+	currentWorker := 0
+	for currentIndex < int(fileSize) {
+		end := uint64(math.Min(float64(currentIndex+chunkSize), float64(fileSize)))
+		//logger.Println("CurrentWorker:", currentWorker)
+		//logger.Println("CurrentIndex:", currentIndex)
+		//logger.Println("End:", end)
+		packet := JobPacket{
+			start: uint64(currentIndex),
+			end:   end,
 		}
-	}
-	if (index/cs)%2 == 0 {
-		padding, err := NewMarkNode(0, index/cs, []byte{})
-		if err != nil {
-			panic(err)
-		}
-		layers[0] <- padding
+		jobs[currentWorker] <- packet
+		currentIndex += chunkSize
+		//logger.Println("After Current Index:", currentIndex)
+		currentWorker = (currentWorker + 1) % workerSize
 	}
 
-	close(job)
-	jobWg.Wait()
-	nn := <-layers[expectedHeight-1]
-	return hex.EncodeToString(nn.hash)
+	if err != nil {
+		return nil, err
+	}
+
+	h := <-layers[expectedHeight-1]
+	return h.hash, nil
+
 }
 
-func worker(file *os.File, s *sync.Pool, startIndex int) (*MarkNode, error) {
-	buffer := s.Get().([]byte)
-	defer s.Put(buffer)
-	_, err := file.ReadAt(buffer, int64(startIndex))
-	if err != nil {
-		return nil, err
+func worker(mmp []byte, channel chan JobPacket) {
+	for p := range channel {
+		buffer := mmp[p.start:p.end]
+		//logger.Println("Buffer", buffer)
+		//logger.Println("Start", current)
+		//logger.Println("End", current)
+		tag := p.start / uint64(chunkSize)
+		//logger.Println("Tag", tag)
+		n, err := NewMarkNode(0, tag, buffer)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		layers[0] <- n
 	}
 
-	cs, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
-	if err != nil {
-		panic(err)
-	}
+}
 
-	mn, err := NewMarkNode(0, startIndex/cs, buffer)
-	if err != nil {
-		return nil, err
-	}
+func pipeLineBuildTree(level uint64) {
 
-	return mn, nil
+	cache := make(map[uint64]*MarkNode)
+
+	for n := range layers[level] {
+		//logger.Println("Level:", level, n)
+		var partner *MarkNode
+		var ok bool
+		if n.tag%2 == 0 {
+			// the tag is even therefor look forward to check
+			partner, ok = cache[n.tag+1]
+		} else {
+			partner, ok = cache[n.tag-1]
+		}
+
+		if ok {
+			newN, err := partner.Hash(n)
+			if err != nil {
+				logger.Fatal(err)
+				return
+			}
+
+			if level+1 > uint64(len(layers)-1) {
+				logger.Fatal("Reached max number of layers", n.tag)
+				return
+			}
+
+			layers[level+1] <- newN
+		} else {
+			cache[n.tag] = n
+		}
+	}
 }

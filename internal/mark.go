@@ -11,13 +11,12 @@ import (
 
 type MarkNode struct {
 	hash  []byte
-	level int
-	tag   int
-	hType string
+	level uint64
+	tag   uint64
 }
 
-func NewMarkNode(level int, tag int, data []byte) (*MarkNode, error) {
-	size, err := envgo.GetValueOrDefault("MARK_SIZE", 256)
+func NewMarkNode(level uint64, tag uint64, data []byte) (*MarkNode, error) {
+	size, err := envgo.GetValueOrDefault("MARK_SIZE", DEFAULT_CHUNK_SIZE)
 	if err != nil {
 		return nil, err
 	}
@@ -37,9 +36,8 @@ func NewMarkNode(level int, tag int, data []byte) (*MarkNode, error) {
 
 	return &MarkNode{
 		hash:  h.Sum(nil),
-		hType: hashType,
 		level: level,
-		tag:   int(tag),
+		tag:   tag,
 	}, nil
 }
 
@@ -58,14 +56,19 @@ func detectHash(hType string) hash.Hash {
 }
 
 func computeNewNode(m *MarkNode, n *MarkNode) (*MarkNode, error) {
-	h := detectHash(n.hType)
+
+	hashType, err := envgo.GetValueOrDefault("HASH_TYPE", "SHA256")
+	if err != nil {
+		return nil, err
+	}
+
+	h := detectHash(hashType)
 	h.Write(m.hash)
 	h.Write(n.hash)
 	return &MarkNode{
 		hash:  h.Sum(nil),
 		level: m.level + 1,
-		tag:   int(math.Ceil(float64(m.tag / 2))),
-		hType: n.hType,
+		tag:   uint64(math.Ceil(float64(m.tag / 2))),
 	}, nil
 }
 

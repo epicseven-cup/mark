@@ -24,9 +24,13 @@ go.work.sum
 
 # env file
 .env
+
+.DS_Store
 *.png
 *.pdf
 
 .idea/
 
 *.iso
+
+*.log

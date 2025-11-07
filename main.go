@@ -15,8 +15,11 @@ func init() {
 }
 
 func main() {
-	path = "data.pdf"
 	flag.Parse()
-	s := internal.MerakHash(path)
+	path := "test.iso"
+	s, err := internal.MerakHash(path)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println(s)
 }
